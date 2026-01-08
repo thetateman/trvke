@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- This adapter normalizes cross-browser differences in WebRTC APIs. Currently necessary in order to support Firefox. -->
+    <script
+      src="https://cdnjs.cloudflare.com/ajax/libs/webrtc-adapter/8.1.2/adapter.min.js"
+      integrity="sha512-l40eBFtXx+ve5RryIELC3y6/OM6Nu89mLGQd7fg1C93tN6XrkC3supb+/YiD/Y+B8P37kdJjtG1MT1kOO2VzxA=="
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    ></script>
+  </head>
+
+
+  <body>
+    <div class="grid">
+      <h1>Realtime Echo Demo</h1>
+      <div>
+        <h2>Local stream</h2>
+        <video id="local-video" autoplay muted></video>
+      </div>
+      <div>
+        <h2>Remote echo stream</h2>
+        <video id="remote-video" autoplay></video>
+      </div>
+    </div>
+
+
+    <script type="module">      
+      // Use Cloudflare's STUN server
+      self.pc = new RTCPeerConnection({
+        iceServers: [
+          {
+            urls: 'stun:stun.cloudflare.com:3478'
+          }
+        ],
+        bundlePolicy: 'max-bundle'
+      });
+
+      // In order to successfully establish a peer connection, we need at least one track to publish.
+      // In this case, we create two: video & audio
+      const localStream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true
+      });
+
+
+      // Get the local video element in the HTML and set the source to show local stream
+      const localVideoElement = document.getElementById('local-video');
+      localVideoElement.srcObject = localStream;
+
+
+      // Add sendonly trancievers to the PeerConnection
+      self.transceivers = localStream.getTracks().map(track =>
+        self.pc.addTransceiver(track, {
+          direction: 'sendonly'
+        })
+      );
+
+
+      // Send the first offer and create a session. The returned sessionId is required to retrieve any track published by this peer
+      await self.pc.setLocalDescription(await self.pc.createOffer());
+
+      // send request to server to create new session
+      async function newSession(sdp){
+        const response = await fetch("/api/newSession", {
+          method: "POST",
+          headers: {
+            'content-type': 'application/json',
+        },
+          body: JSON.stringify({sdp})
+        });
+        const result = await response.json()
+        return result.newSessionResult;
+      }
+      async function newTracks(trackObjects, sdp=null){
+        const response = await fetch("/api/newTracks", {
+          method: "POST",
+          headers: {
+            'content-type': 'application/json',
+        },
+          body: JSON.stringify({trackObjects, sdp})
+        });
+        const result = await response.json()
+        return result.newLocalTracksResult;
+      }
+      async function sendAnswerSDP(answer){
+        const response = await fetch("/api/sendAnswerSDP", {
+          method: "POST",
+          headers: {
+            'content-type': 'application/json',
+        },
+          body: JSON.stringify({answer})
+        });
+        const result = await response.json()
+        return result;
+      }
+      const newSessionResult = await newSession(self.pc.localDescription.sdp);
+      // const newSessionResult = await self.app.newSession(
+      //   self.pc.localDescription.sdp
+      // );
+      await self.pc.setRemoteDescription(
+        new RTCSessionDescription(newSessionResult.sessionDescription)
+      );
+
+
+      // Make the peer connection was established
+      await new Promise((resolve, reject) => {
+        self.pc.addEventListener('iceconnectionstatechange', ev => {
+          if (ev.target.iceConnectionState === 'connected') {
+            resolve();
+          }
+          setTimeout(reject, 5000, 'connect timeout');
+        });
+      });
+
+
+      // We associate a trackName to a transceiver identified by a mid (media ID). This way the track
+      // is remotely reachable by the tuple (sessionId, trackName)
+      let trackObjects = self.transceivers.map(transceiver => {
+        return {
+          location: 'local',
+          mid: transceiver.mid,
+          trackName: transceiver.sender.track.id
+        };
+      });
+
+
+      // Get local description, create a new track, set remote description with the response
+      await self.pc.setLocalDescription(await self.pc.createOffer());
+      const newLocalTracksResult = await newTracks(trackObjects, self.pc.localDescription.sdp);
+      // const newLocalTracksResult = await self.app.newTracks(
+      //   trackObjects,
+      //   self.pc.localDescription.sdp
+      // );
+      await self.pc.setRemoteDescription(
+        new RTCSessionDescription(newLocalTracksResult.sessionDescription)
+      );
+
+
+      // At this point in code, we are successfully sending local stream to Cloudflare Realtime.
+      // Now, we will pull the same stream from Cloudflare Realtime.
+
+
+      // Update trackObjects to reference the tracks as "remote"
+      trackObjects = trackObjects.map(trackObject => {
+        return {
+          location: 'remote',
+          sessionId: newSessionResult.sessionId,
+          trackName: trackObject.trackName
+        };
+      });
+
+      let numTracksWaitingFor = 2;
+      // Prepare to receive the tracks before asking for them
+      const remoteTracksPromise = new Promise(resolve => {
+        let tracks = [];
+        self.pc.ontrack = event => {
+          tracks.push(event.track);
+          console.debug(`Got track mid=${event.track.mid}`);
+          if (tracks.length >= numTracksWaitingFor) {
+            // remote video & audio are ready
+            resolve(tracks);
+          }
+        };
+      });
+
+
+      // Realtime API request to ask for the tracks
+      const newRemoteTracksResult = await newTracks(trackObjects);
+      if (newRemoteTracksResult.requiresImmediateRenegotiation) {
+        switch (newRemoteTracksResult.sessionDescription.type) {
+          case 'offer':
+            // We let Cloudflare know we're ready to receive the tracks
+            await self.pc.setRemoteDescription(
+              new RTCSessionDescription(
+                newRemoteTracksResult.sessionDescription
+              )
+            );
+            await self.pc.setLocalDescription(await self.pc.createAnswer());
+            await sendAnswerSDP(self.pc.localDescription.sdp);
+            break;
+          case 'answer':
+            throw new Error('An offer SDP was expected');
+        }
+      }
+
+
+      // Once started receiving the tracks (video & audio) send the data to the video tag
+      const remoteTracks = await remoteTracksPromise;
+      const remoteVideoElement = document.getElementById('remote-video');
+      const remoteStream = new MediaStream();
+      for(let i = 0; i < numTracksWaitingFor; i++){
+        remoteStream.addTrack(remoteTracks[i])
+      }
+      remoteVideoElement.srcObject = remoteStream;
+    </script>
+    <style>
+      /* Styles are safe to ignore, just here for demo */
+
+
+      html {
+        color-scheme: light dark;
+        font-family:
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          'Segoe UI',
+          Roboto,
+          Oxygen,
+          Ubuntu,
+          Cantarell,
+          'Open Sans',
+          'Helvetica Neue',
+          sans-serif;
+        background: black;
+        color: white;
+      }
+      body,
+      h1,
+      h2 {
+        margin: 0;
+      }
+      h1,
+      h2 {
+        font-weight: 400;
+      }
+      h1 {
+        font-size: 1.5rem;
+        grid-column: 1 / -1;
+      }
+      h2 {
+        font-size: 1rem;
+        margin-bottom: 0.5rem;
+      }
+      video {
+        width: 100%;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 1rem;
+      }
+
+
+      @media (max-width: 500px) {
+        .grid {
+          grid-template-columns: minmax(0, 1fr);
+        }
+      }
+    </style>
+  </body>
+</html>
+
