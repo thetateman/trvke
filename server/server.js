@@ -1,10 +1,15 @@
 "use strict";
 
-const path = require('path');
-const http = require('http');
-const express = require('express');
+import path from "path";
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+import http from "http";
+import express from "express";
+import { config } from "dotenv";
+import { WebSocketServer } from "ws";
+config();
 
-require('dotenv').config();
 const appId = process.env.APPID;
 const appSecret = process.env.APPSECRET;
 
@@ -21,7 +26,7 @@ app.set('trust proxy', 'loopback');
 app.use(express.json());
 app.use(express.urlencoded({extended: true}));
 
-
+const allTracks = {};
 
 // This is a class the defines the Realtime API interactions.
 // It's not an SDK but a example of how Realtime API can be used.
@@ -78,7 +83,7 @@ class RealtimeApp {
 
 
     // newTracks shares local tracks or gets tracks
-    async newTracks(trackObjects, offerSDP = null) {
+    async newTracks(trackObjects, sessionId, offerSDP = null) {
         const url = `${this.prefixPath}/sessions/${this.sessionId}/tracks/new`;
         const body = {
         sessionDescription: {
@@ -92,6 +97,12 @@ class RealtimeApp {
         }
         const result = await this.sendRequest(url, body);
         this.checkErrors(result, trackObjects.length);
+        if(trackObjects[0].location == 'local'){ // these are tracks being published.
+            result.tracks.forEach((track)=>{
+                allTracks[track.trackName] = {location: "remote", sessionId: sessionId, trackName: track.trackName}
+            })
+        }
+        
         return result;
     }
 
@@ -126,6 +137,7 @@ app.use("/api/newTracks", async (req, res)=>{
     let body = req.body
     const newLocalTracksResult = await rtApp.newTracks(
       body.trackObjects,
+      body.sessionId,
       body.sdp
     );
     req.responseObj = {newLocalTracksResult}
@@ -205,6 +217,37 @@ app.use('/game', (req, res) => {
 */
 
 const server = http.createServer(app);
+let wss = new WebSocketServer({server});
+
+wss.on('connection', function connection(ws, req){
+  let ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  console.log(`${ip} connected.`)
+  ws.on('error', (e)=>{
+    console.error(e);
+  });
+  ws.on('close', function close(message){
+    console.log(`${ip} disconnected`)
+  })
+  ws.on('message', function message(data, isBinary){
+    const message = isBinary ? data : data.toString();
+
+    let messageObj;
+    try{
+      messageObj = JSON.parse(message);
+      if(!messageObj?.method){
+        throw new Error("Invalid message");
+      }
+
+    } catch(e){
+      ws.send(JSON.stringify({errors:"Invalid message. Failed to subscribe."}));
+      return;
+    }
+    console.log(messageObj);
+    if(messageObj.method === 'getTracks'){
+      ws.send(JSON.stringify(allTracks))
+    } 
+  })
+});
 
 
 server.on('error', (err) => {

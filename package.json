@@ -16,7 +16,8 @@
     "dotenv": "^16.6.1",
     "express": "^4.17.3",
     "express-session": "^1.17.2",
-    "helmet": "^5.1.0"
+    "helmet": "^5.1.0",
+    "ws": "^8.19.0"
   },
   "bugs": {
     "url": "https://github.com/thetateman/trvke/issues"

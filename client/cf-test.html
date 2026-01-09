@@ -38,6 +38,78 @@
         bundlePolicy: 'max-bundle'
       });
 
+      let host = window.location.host;
+      const ws = new WebSocket(`ws://${host}`);
+      let websocketOpen = false;
+      const websocketOpenPromise = new Promise(resolve => {
+        if(websocketOpen) resolve();
+        ws.addEventListener('open', function open() {
+          websocketOpen = true;
+          resolve();
+        });
+      })
+
+      ws.addEventListener('open', function open() {
+        websocketOpen = true;
+        // Subscribing to token creation events
+        // let payload = {
+        //     method: "getTracks", 
+        //   }
+        // ws.send(JSON.stringify(payload));
+      });
+
+      ws.addEventListener('message', async function message(message) {
+        let data = JSON.parse(message.data);
+        console.log(data);
+        if(Object.keys(data).length > 0){
+          // There are already tracks live in the call. time to join in!
+          let numTracksWaitingFor = Object.keys(data).length;
+          // Prepare to receive the tracks before asking for them
+          const remoteTracksPromise = new Promise(resolve => {
+            let tracks = [];
+            self.pc.ontrack = event => {
+              tracks.push(event.track);
+              console.debug(`Got track mid=${event.track.mid}`);
+              if (tracks.length >= numTracksWaitingFor) {
+                // remote video & audio are ready
+                resolve(tracks);
+              }
+            };
+          });
+
+
+          // Realtime API request to ask for the tracks
+          const newRemoteTracksResult = await newTracks(Object.values(data));
+          if (newRemoteTracksResult.requiresImmediateRenegotiation) {
+            switch (newRemoteTracksResult.sessionDescription.type) {
+              case 'offer':
+                // We let Cloudflare know we're ready to receive the tracks
+                await self.pc.setRemoteDescription(
+                  new RTCSessionDescription(
+                    newRemoteTracksResult.sessionDescription
+                  )
+                );
+                await self.pc.setLocalDescription(await self.pc.createAnswer());
+                await sendAnswerSDP(self.pc.localDescription.sdp);
+                break;
+              case 'answer':
+                throw new Error('An offer SDP was expected');
+            }
+          }
+
+
+          // Once started receiving the tracks (video & audio) send the data to the video tag
+          const remoteTracks = await remoteTracksPromise;
+          const remoteVideoElement = document.getElementById('remote-video');
+          const remoteStream = new MediaStream();
+          for(let i = 0; i < numTracksWaitingFor; i++){
+            remoteStream.addTrack(remoteTracks[i])
+          }
+          remoteVideoElement.srcObject = remoteStream;
+        }
+      
+      });
+
       // In order to successfully establish a peer connection, we need at least one track to publish.
       // In this case, we create two: video & audio
       const localStream = await navigator.mediaDevices.getUserMedia({
@@ -80,7 +152,7 @@
           headers: {
             'content-type': 'application/json',
         },
-          body: JSON.stringify({trackObjects, sdp})
+          body: JSON.stringify({trackObjects, sessionId: localStorage.sessionId, sdp})
         });
         const result = await response.json()
         return result.newLocalTracksResult;
@@ -97,6 +169,13 @@
         return result;
       }
       const newSessionResult = await newSession(self.pc.localDescription.sdp);
+      localStorage.sessionId = newSessionResult.sessionId;
+      //Subscribing to token creation events
+      await websocketOpenPromise
+      let payload = {
+        method: "getTracks", 
+      }
+      ws.send(JSON.stringify(payload));
       // const newSessionResult = await self.app.newSession(
       //   self.pc.localDescription.sdp
       // );
@@ -122,7 +201,8 @@
         return {
           location: 'local',
           mid: transceiver.mid,
-          trackName: transceiver.sender.track.id
+          trackName: transceiver.sender.track.id,
+          kind: transceiver.sender.track.kind,
         };
       });
 
@@ -144,57 +224,15 @@
 
 
       // Update trackObjects to reference the tracks as "remote"
-      trackObjects = trackObjects.map(trackObject => {
-        return {
-          location: 'remote',
-          sessionId: newSessionResult.sessionId,
-          trackName: trackObject.trackName
-        };
-      });
+      // trackObjects = trackObjects.map(trackObject => {
+      //   return {
+      //     location: 'remote',
+      //     sessionId: newSessionResult.sessionId,
+      //     trackName: trackObject.trackName
+      //   };
+      // });
 
-      let numTracksWaitingFor = 2;
-      // Prepare to receive the tracks before asking for them
-      const remoteTracksPromise = new Promise(resolve => {
-        let tracks = [];
-        self.pc.ontrack = event => {
-          tracks.push(event.track);
-          console.debug(`Got track mid=${event.track.mid}`);
-          if (tracks.length >= numTracksWaitingFor) {
-            // remote video & audio are ready
-            resolve(tracks);
-          }
-        };
-      });
-
-
-      // Realtime API request to ask for the tracks
-      const newRemoteTracksResult = await newTracks(trackObjects);
-      if (newRemoteTracksResult.requiresImmediateRenegotiation) {
-        switch (newRemoteTracksResult.sessionDescription.type) {
-          case 'offer':
-            // We let Cloudflare know we're ready to receive the tracks
-            await self.pc.setRemoteDescription(
-              new RTCSessionDescription(
-                newRemoteTracksResult.sessionDescription
-              )
-            );
-            await self.pc.setLocalDescription(await self.pc.createAnswer());
-            await sendAnswerSDP(self.pc.localDescription.sdp);
-            break;
-          case 'answer':
-            throw new Error('An offer SDP was expected');
-        }
-      }
-
-
-      // Once started receiving the tracks (video & audio) send the data to the video tag
-      const remoteTracks = await remoteTracksPromise;
-      const remoteVideoElement = document.getElementById('remote-video');
-      const remoteStream = new MediaStream();
-      for(let i = 0; i < numTracksWaitingFor; i++){
-        remoteStream.addTrack(remoteTracks[i])
-      }
-      remoteVideoElement.srcObject = remoteStream;
+      
     </script>
     <style>
       /* Styles are safe to ignore, just here for demo */
