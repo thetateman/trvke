@@ -112,10 +112,15 @@
 
       // In order to successfully establish a peer connection, we need at least one track to publish.
       // In this case, we create two: video & audio
-      const localStream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: true
-      });
+      try{
+        const localStream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true
+        });
+      } catch(e){
+        console.error(e);
+      }
+
 
 
       // Get the local video element in the HTML and set the source to show local stream
