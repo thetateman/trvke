@@ -244,7 +244,13 @@ wss.on('connection', function connection(ws, req){
     }
     console.log(messageObj);
     if(messageObj.method === 'getTracks'){
-      ws.send(JSON.stringify(allTracks))
+      ws.send(JSON.stringify({method: 'getTracks', allTracks}))
+    } else if(messageObj.method === 'newTracksAdded'){
+        wss.clients.forEach(client => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({method: "newTracksAdded", allTracks: messageObj.tracksAdded}));
+            }
+        });
     } 
   })
 });
