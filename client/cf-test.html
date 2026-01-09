@@ -16,6 +16,7 @@
   <body>
     <div class="grid">
       <h1>Realtime Echo Demo</h1>
+      <button id="join-btn">JoinCall</button>
       <div>
         <h2>Local stream</h2>
         <video id="local-video" autoplay muted></video>
@@ -27,195 +28,201 @@
     </div>
 
 
-    <script type="module">      
-      // Use Cloudflare's STUN server
-      self.pc = new RTCPeerConnection({
-        iceServers: [
-          {
-            urls: 'stun:stun.cloudflare.com:3478'
-          }
-        ],
-        bundlePolicy: 'max-bundle'
-      });
+    <script type="module">
+      let joinCallButton = document.getElementById("join-btn");      
+      joinCallButton.addEventListener("click", async ()=>{
 
-      let host = window.location.host;
-      const ws = new WebSocket(`ws://${host}`);
-      let websocketOpen = false;
-      const websocketOpenPromise = new Promise(resolve => {
-        if(websocketOpen) resolve();
+      
+        // Use Cloudflare's STUN server
+        self.pc = new RTCPeerConnection({
+          iceServers: [
+            {
+              urls: 'stun:stun.cloudflare.com:3478'
+            }
+          ],
+          bundlePolicy: 'max-bundle'
+        });
+
+        let host = window.location.host;
+        const ws = new WebSocket(`ws://${host}`);
+        let websocketOpen = false;
+        const websocketOpenPromise = new Promise(resolve => {
+          if(websocketOpen) resolve();
+          ws.addEventListener('open', function open() {
+            websocketOpen = true;
+            resolve();
+          });
+        })
+
         ws.addEventListener('open', function open() {
           websocketOpen = true;
-          resolve();
+          // Subscribing to token creation events
+          // let payload = {
+          //     method: "getTracks", 
+          //   }
+          // ws.send(JSON.stringify(payload));
         });
-      })
 
-      ws.addEventListener('open', function open() {
-        websocketOpen = true;
-        // Subscribing to token creation events
-        // let payload = {
-        //     method: "getTracks", 
-        //   }
-        // ws.send(JSON.stringify(payload));
-      });
+        ws.addEventListener('message', async function message(message) {
+          let data = JSON.parse(message.data);
+          console.log(data);
+          if(Object.keys(data).length > 0){
+            // There are already tracks live in the call. time to join in!
+            let numTracksWaitingFor = Object.keys(data).length;
+            // Prepare to receive the tracks before asking for them
+            const remoteTracksPromise = new Promise(resolve => {
+              let tracks = [];
+              self.pc.ontrack = event => {
+                tracks.push(event.track);
+                console.debug(`Got track mid=${event.track.mid}`);
+                if (tracks.length >= numTracksWaitingFor) {
+                  // remote video & audio are ready
+                  resolve(tracks);
+                }
+              };
+            });
 
-      ws.addEventListener('message', async function message(message) {
-        let data = JSON.parse(message.data);
-        console.log(data);
-        if(Object.keys(data).length > 0){
-          // There are already tracks live in the call. time to join in!
-          let numTracksWaitingFor = Object.keys(data).length;
-          // Prepare to receive the tracks before asking for them
-          const remoteTracksPromise = new Promise(resolve => {
-            let tracks = [];
-            self.pc.ontrack = event => {
-              tracks.push(event.track);
-              console.debug(`Got track mid=${event.track.mid}`);
-              if (tracks.length >= numTracksWaitingFor) {
-                // remote video & audio are ready
-                resolve(tracks);
+
+            // Realtime API request to ask for the tracks
+            const newRemoteTracksResult = await newTracks(Object.values(data));
+            if (newRemoteTracksResult.requiresImmediateRenegotiation) {
+              switch (newRemoteTracksResult.sessionDescription.type) {
+                case 'offer':
+                  // We let Cloudflare know we're ready to receive the tracks
+                  await self.pc.setRemoteDescription(
+                    new RTCSessionDescription(
+                      newRemoteTracksResult.sessionDescription
+                    )
+                  );
+                  await self.pc.setLocalDescription(await self.pc.createAnswer());
+                  await sendAnswerSDP(self.pc.localDescription.sdp);
+                  break;
+                case 'answer':
+                  throw new Error('An offer SDP was expected');
               }
+            }
+
+
+            // Once started receiving the tracks (video & audio) send the data to the video tag
+            const remoteTracks = await remoteTracksPromise;
+            const remoteVideoElement = document.getElementById('remote-video');
+            const remoteStream = new MediaStream();
+            for(let i = 0; i < numTracksWaitingFor; i++){
+              remoteStream.addTrack(remoteTracks[i])
+            }
+            remoteVideoElement.srcObject = remoteStream;
+            remoteVideoElement.play();
+          }
+        
+        });
+        let localStreamGranted = false;
+        let localStream;
+        // In order to successfully establish a peer connection, we need at least one track to publish.
+        // In this case, we create two: video & audio
+        try{
+          localStream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true
+          });
+          localStreamGranted = true;
+        } catch(e){
+          console.error(e);
+        }
+
+
+        if(localStreamGranted){
+          // Get the local video element in the HTML and set the source to show local stream
+          const localVideoElement = document.getElementById('local-video');
+          localVideoElement.srcObject = localStream;
+
+
+          // Add sendonly trancievers to the PeerConnection
+          self.transceivers = localStream.getTracks().map(track =>
+            self.pc.addTransceiver(track, {
+              direction: 'sendonly'
+            })
+          );
+        } else {
+          // Create receive-only audio
+          self.pc.addTransceiver("audio", {
+            direction: "recvonly"
+          });
+
+          // Create receive-only video
+          self.pc.addTransceiver("video", {
+            direction: "recvonly"
+          });
+        }
+        
+        // Send the first offer and create a session. The returned sessionId is required to retrieve any track published by this peer
+        await self.pc.setLocalDescription(await self.pc.createOffer());
+        
+        const newSessionResult = await newSession(self.pc?.localDescription?.sdp);
+        localStorage.sessionId = newSessionResult.sessionId;
+        //Subscribing to token creation events
+        await websocketOpenPromise
+        let payload = {
+          method: "getTracks", 
+        }
+        ws.send(JSON.stringify(payload));
+        // const newSessionResult = await self.app.newSession(
+        //   self.pc.localDescription.sdp
+        // );
+        await self.pc.setRemoteDescription(
+          new RTCSessionDescription(newSessionResult.sessionDescription)
+        );
+
+
+        // Make the peer connection was established
+        await new Promise((resolve, reject) => {
+          self.pc.addEventListener('iceconnectionstatechange', ev => {
+            if (ev.target.iceConnectionState === 'connected') {
+              resolve();
+            }
+            setTimeout(reject, 5000, 'connect timeout');
+          });
+        });
+
+        if(localStreamGranted){
+          // We associate a trackName to a transceiver identified by a mid (media ID). This way the track
+          // is remotely reachable by the tuple (sessionId, trackName)
+          let trackObjects = self.transceivers.map(transceiver => {
+            return {
+              location: 'local',
+              mid: transceiver.mid,
+              trackName: transceiver.sender.track.id,
+              kind: transceiver.sender.track.kind,
             };
           });
 
 
-          // Realtime API request to ask for the tracks
-          const newRemoteTracksResult = await newTracks(Object.values(data));
-          if (newRemoteTracksResult.requiresImmediateRenegotiation) {
-            switch (newRemoteTracksResult.sessionDescription.type) {
-              case 'offer':
-                // We let Cloudflare know we're ready to receive the tracks
-                await self.pc.setRemoteDescription(
-                  new RTCSessionDescription(
-                    newRemoteTracksResult.sessionDescription
-                  )
-                );
-                await self.pc.setLocalDescription(await self.pc.createAnswer());
-                await sendAnswerSDP(self.pc.localDescription.sdp);
-                break;
-              case 'answer':
-                throw new Error('An offer SDP was expected');
-            }
-          }
-
-
-          // Once started receiving the tracks (video & audio) send the data to the video tag
-          const remoteTracks = await remoteTracksPromise;
-          const remoteVideoElement = document.getElementById('remote-video');
-          const remoteStream = new MediaStream();
-          for(let i = 0; i < numTracksWaitingFor; i++){
-            remoteStream.addTrack(remoteTracks[i])
-          }
-          remoteVideoElement.srcObject = remoteStream;
+          // Get local description, create a new track, set remote description with the response
+          await self.pc.setLocalDescription(await self.pc.createOffer());
+          const newLocalTracksResult = await newTracks(trackObjects, self.pc.localDescription.sdp);
+          // const newLocalTracksResult = await self.app.newTracks(
+          //   trackObjects,
+          //   self.pc.localDescription.sdp
+          // );
+          await self.pc.setRemoteDescription(
+            new RTCSessionDescription(newLocalTracksResult.sessionDescription)
+          );
         }
-      
-      });
-      let localStreamGranted = false;
-      let localStream;
-      // In order to successfully establish a peer connection, we need at least one track to publish.
-      // In this case, we create two: video & audio
-      try{
-        localStream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: true
-        });
-        localStreamGranted = true;
-      } catch(e){
-        console.error(e);
-      }
+        
 
 
-      if(localStreamGranted){
-        // Get the local video element in the HTML and set the source to show local stream
-        const localVideoElement = document.getElementById('local-video');
-        localVideoElement.srcObject = localStream;
+        // At this point in code, we are successfully sending local stream to Cloudflare Realtime.
+        // Now, we will pull the same stream from Cloudflare Realtime.
 
 
-        // Add sendonly trancievers to the PeerConnection
-        self.transceivers = localStream.getTracks().map(track =>
-          self.pc.addTransceiver(track, {
-            direction: 'sendonly'
-          })
-        );
-      } else {
-        // Create receive-only audio
-        self.pc.addTransceiver("audio", {
-          direction: "recvonly"
-        });
-
-        // Create receive-only video
-        self.pc.addTransceiver("video", {
-          direction: "recvonly"
-        });
-      }
-      
-      // Send the first offer and create a session. The returned sessionId is required to retrieve any track published by this peer
-      await self.pc.setLocalDescription(await self.pc.createOffer());
-      
-      const newSessionResult = await newSession(self.pc?.localDescription?.sdp);
-      localStorage.sessionId = newSessionResult.sessionId;
-      //Subscribing to token creation events
-      await websocketOpenPromise
-      let payload = {
-        method: "getTracks", 
-      }
-      ws.send(JSON.stringify(payload));
-      // const newSessionResult = await self.app.newSession(
-      //   self.pc.localDescription.sdp
-      // );
-      await self.pc.setRemoteDescription(
-        new RTCSessionDescription(newSessionResult.sessionDescription)
-      );
-
-
-      // Make the peer connection was established
-      await new Promise((resolve, reject) => {
-        self.pc.addEventListener('iceconnectionstatechange', ev => {
-          if (ev.target.iceConnectionState === 'connected') {
-            resolve();
-          }
-          setTimeout(reject, 5000, 'connect timeout');
-        });
-      });
-
-      if(localStreamGranted){
-        // We associate a trackName to a transceiver identified by a mid (media ID). This way the track
-        // is remotely reachable by the tuple (sessionId, trackName)
-        let trackObjects = self.transceivers.map(transceiver => {
-          return {
-            location: 'local',
-            mid: transceiver.mid,
-            trackName: transceiver.sender.track.id,
-            kind: transceiver.sender.track.kind,
-          };
-        });
-
-
-        // Get local description, create a new track, set remote description with the response
-        await self.pc.setLocalDescription(await self.pc.createOffer());
-        const newLocalTracksResult = await newTracks(trackObjects, self.pc.localDescription.sdp);
-        // const newLocalTracksResult = await self.app.newTracks(
-        //   trackObjects,
-        //   self.pc.localDescription.sdp
-        // );
-        await self.pc.setRemoteDescription(
-          new RTCSessionDescription(newLocalTracksResult.sessionDescription)
-        );
-      }
-      
-
-
-      // At this point in code, we are successfully sending local stream to Cloudflare Realtime.
-      // Now, we will pull the same stream from Cloudflare Realtime.
-
-
-      // Update trackObjects to reference the tracks as "remote"
-      // trackObjects = trackObjects.map(trackObject => {
-      //   return {
-      //     location: 'remote',
-      //     sessionId: newSessionResult.sessionId,
-      //     trackName: trackObject.trackName
-      //   };
-      // });
+        // Update trackObjects to reference the tracks as "remote"
+        // trackObjects = trackObjects.map(trackObject => {
+        //   return {
+        //     location: 'remote',
+        //     sessionId: newSessionResult.sessionId,
+        //     trackName: trackObject.trackName
+        //   };
+        // });
+      })
 
 
       // API Helpers
@@ -296,6 +303,10 @@
       }
       video {
         width: 100%;
+      }
+      #join-btn{
+        width: 20%;
+        height: 20%;
       }
       .grid {
         display: grid;
