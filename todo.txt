@@ -1,0 +1,1 @@
+1. signaling server (websocket controls joins and leaves)(leaves are critical because attempting to sub to a dead track breaks will cause client to fail to join the call.)
